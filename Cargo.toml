@@ -1,6 +1,6 @@
 [package]
 name = "numa_maps"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2021"
 authors = ["Moritz Hoffmann <antiguru@gmail.com>"]
 description = "Parse the numa_maps file"
