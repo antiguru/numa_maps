@@ -11,7 +11,22 @@ numa_maps = "0.1"
 ## Example
 
 ```rust
+#[cfg(target_os = "linux")]
+let map = numa_maps::NumaMap::from_file("/proc/self/numa_maps").unwrap();
+#[cfg(not(target_os = "linux"))]
+let map = numa_maps::NumaMap::default();
+
+for region in &map.ranges {
+    println!("base: {:x} -> {:?}", region.address, region.properties);
+}
+
 ```
+
+## Description
+
+`numa_maps` provides a simple API to read the contents of the `numa_maps` file.
+It parses the file into ranges with a base address, a policy, and a list of
+properties.
 
 #### License
 
