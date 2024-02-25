@@ -8,7 +8,7 @@ use std::str::FromStr;
 
 /// Properties for memory regions. Consult `man 7 numa` for details.
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
-pub enum NumaMapProperty {
+pub enum Property {
     /// File backing the memory region.
     File(PathBuf),
     /// Size on each numa node `(numa_node, size)`. Size in pages, or bytes after normalizing.
@@ -37,8 +37,9 @@ pub enum NumaMapProperty {
     Kernelpagesize(usize),
 }
 
-impl NumaMapProperty {
+impl Property {
     /// Returns the kernel page size if the property matches the page size property.
+    #[must_use]
     pub fn page_size(&self) -> Option<usize> {
         match self {
             Self::Kernelpagesize(page_size) => Some(*page_size),
@@ -48,8 +49,9 @@ impl NumaMapProperty {
 
     /// Normalize the property given the page size. Returns an
     /// optional value, which is set for all but the page size property.
+    #[must_use]
     pub fn normalize(self, page_size: usize) -> Option<Self> {
-        use NumaMapProperty::*;
+        use Property::*;
         match self {
             File(p) => Some(File(p)),
             N(node, pages) => Some(N(node, pages * page_size)),
@@ -68,7 +70,7 @@ impl NumaMapProperty {
     }
 }
 
-impl FromStr for NumaMapProperty {
+impl FromStr for Property {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -109,45 +111,48 @@ impl FromStr for NumaMapProperty {
     }
 }
 
-/// A numa map entry, with a base address and a list of properties.
+/// A memory range, with a base address and a list of properties.
 #[derive(Debug, Ord, PartialOrd, Eq, PartialEq)]
-pub struct NumaMapEntry {
-    /// The base address of this memory region.
+pub struct Range {
+    /// The base address of this memory range.
     pub address: usize,
-    /// Properties associated with the memory region.
-    pub properties: Vec<NumaMapProperty>,
+    /// The range's memory policy.
+    pub policy: String,
+    /// Properties associated with the memory range.
+    pub properties: Vec<Property>,
 }
 
-impl NumaMapEntry {
-    /// Parse a numa map entry. Prints errors to stderr.
+impl Range {
+    /// Parse a numa map line. Prints errors to stderr.
     ///
-    /// Returns an absent value if the line does not contain an address, or the address is
+    /// Returns no value if the line does not contain an address, or the address is
     /// malformed.
-    fn parse_numa_map(line: &str) -> Option<Self> {
+    fn parse(line: &str) -> Option<Self> {
         let mut parts = line.split_whitespace();
         let address = <usize>::from_str_radix(parts.next()?, 16).ok()?;
-        let _default = parts.next();
+        let policy = parts.next()?.to_string();
         let mut properties = Vec::new();
         for part in parts {
-            match part.parse::<NumaMapProperty>() {
+            match part.parse::<Property>() {
                 Ok(property) => properties.push(property),
                 Err(err) => eprintln!("Failed to parse numa_map entry \"{part}\": {err}"),
             }
         }
         Some(Self {
-            properties,
             address,
+            policy,
+            properties,
         })
     }
 
-    /// Normalize the entry using the page size property, if it exists.
+    /// Normalize the range using the page size property, if it exists.
     pub fn normalize(&mut self) {
-        let page_size = self.properties.iter().find_map(NumaMapProperty::page_size);
+        let page_size = self.properties.iter().find_map(Property::page_size);
         if let Some(page_size) = page_size {
             let mut properties: Vec<_> = self
                 .properties
                 .drain(..)
-                .filter_map(|p| NumaMapProperty::normalize(p, page_size))
+                .filter_map(|p| Property::normalize(p, page_size))
                 .collect();
             properties.sort();
             self.properties = properties;
@@ -158,31 +163,31 @@ impl NumaMapEntry {
 /// A whole `numu_maps` file.
 #[derive(Default)]
 pub struct NumaMap {
-    /// Individual memory regions.
-    pub entries: Vec<NumaMapEntry>,
+    /// Individual memory ranges.
+    pub ranges: Vec<Range>,
 }
 
 impl NumaMap {
     /// Read a `numa_maps` file from `path`.
     ///
-    /// Parses the contents and returns them as [`Self`]. Each line gets an entry in
-    /// [`Self::entries`], which stores the properties gathered from the file as
-    /// [`NumaMapProperty`].
+    /// Parses the contents and returns them as [`NumaMap`]. Each line translates
+    /// to an entry in [`NumaMap::ranges`], which stores the properties gathered
+    /// from the file as [`Property`].
     ///
     /// # Errors
     ///
     /// Returns an error if it fails to read the file.
-    pub fn read_numa_maps<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
+    pub fn from_file<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
 
-        let mut entries = Vec::new();
+        let mut ranges = Vec::new();
         for line in reader.lines() {
-            if let Some(entry) = NumaMapEntry::parse_numa_map(&(line?)) {
-                entries.push(entry);
+            if let Some(range) = Range::parse(&(line?)) {
+                ranges.push(range);
             }
         }
-        Ok(Self { entries })
+        Ok(Self { ranges })
     }
 }
 
@@ -192,18 +197,15 @@ mod test {
 
     #[test]
     fn test_read() -> std::io::Result<()> {
-        let map = NumaMap::read_numa_maps("resources/numa_maps")?;
+        let map = NumaMap::from_file("resources/numa_maps")?;
 
-        assert_eq!(map.entries.len(), 23);
+        assert_eq!(map.ranges.len(), 23);
 
-        println!("{:?}", map.entries);
-
-        use NumaMapProperty::{
-            Active, Anon, Dirty, File, Heap, Kernelpagesize, MapMax, Mapped, Stack, N,
-        };
+        use Property::{Active, Anon, Dirty, File, Heap, Kernelpagesize, MapMax, Mapped, Stack, N};
         let expected = [
-            NumaMapEntry {
+            Range {
                 address: 93893825802240,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/bin/cat".into()),
                     Mapped(2),
@@ -213,8 +215,9 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 93893825810432,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/bin/cat".into()),
                     Mapped(6),
@@ -224,8 +227,9 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 93893825835008,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/bin/cat".into()),
                     Mapped(3),
@@ -235,8 +239,9 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 93893825847296,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/bin/cat".into()),
                     Anon(1),
@@ -246,8 +251,9 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 93893825851392,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/bin/cat".into()),
                     Anon(1),
@@ -257,12 +263,14 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 93893836886016,
+                policy: "default".to_string(),
                 properties: vec![Heap, Anon(2), Dirty(2), N(0, 2), Kernelpagesize(4096)],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172716933120,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/lib/locale/locale-archive".into()),
                     Mapped(94),
@@ -272,12 +280,14 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172721541120,
+                policy: "default".to_string(),
                 properties: vec![Anon(3), Dirty(3), Active(1), N(0, 3), Kernelpagesize(4096)],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172721692672,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/lib/x86_64-linux-gnu/libc.so.6".into()),
                     Mapped(38),
@@ -286,8 +296,9 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172721848320,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/lib/x86_64-linux-gnu/libc.so.6".into()),
                     Mapped(192),
@@ -296,8 +307,9 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172723245056,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/lib/x86_64-linux-gnu/libc.so.6".into()),
                     Mapped(43),
@@ -306,8 +318,9 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172723589120,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/lib/x86_64-linux-gnu/libc.so.6".into()),
                     Anon(4),
@@ -317,8 +330,9 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172723605504,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/lib/x86_64-linux-gnu/libc.so.6".into()),
                     Anon(2),
@@ -328,16 +342,19 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172723613696,
+                policy: "default".to_string(),
                 properties: vec![Anon(5), Dirty(5), Active(1), N(0, 5), Kernelpagesize(4096)],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172723773440,
+                policy: "default".to_string(),
                 properties: vec![Anon(1), Dirty(1), Active(0), N(0, 1), Kernelpagesize(4096)],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172723781632,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2".into()),
                     Mapped(1),
@@ -346,8 +363,9 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172723785728,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2".into()),
                     Mapped(37),
@@ -356,8 +374,9 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172723937280,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2".into()),
                     Mapped(10),
@@ -366,8 +385,9 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172723978240,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2".into()),
                     Anon(2),
@@ -377,8 +397,9 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 140172723986432,
+                policy: "default".to_string(),
                 properties: vec![
                     File("/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2".into()),
                     Anon(2),
@@ -388,8 +409,9 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 140736328499200,
+                policy: "default".to_string(),
                 properties: vec![
                     Stack,
                     Anon(3),
@@ -399,35 +421,45 @@ mod test {
                     Kernelpagesize(4096),
                 ],
             },
-            NumaMapEntry {
+            Range {
                 address: 140736330227712,
+                policy: "default".to_string(),
                 properties: vec![],
             },
-            NumaMapEntry {
+            Range {
                 address: 140736330244096,
+                policy: "default".to_string(),
                 properties: vec![],
             },
         ];
 
-        assert_eq!(&expected[..], &map.entries[..]);
+        assert_eq!(&expected[..], &map.ranges[..]);
 
         Ok(())
     }
 
     #[test]
     fn test_normalize() {
-        use NumaMapProperty::*;
+        use Property::*;
 
         let line = "7fbd0c10f000 default anon=5 dirty=5 active=1 N0=5 kernelpagesize_kB=4";
-        let mut entry = NumaMapEntry::parse_numa_map(line).unwrap();
-        entry.normalize();
-        entry.properties.sort();
+        let mut range = Range::parse(line).unwrap();
+        range.normalize();
+        range.properties.sort();
         let expected = vec![
             N(0, 5 << 12),
             Anon(5 << 12),
             Dirty(5 << 12),
             Active(1 << 12),
         ];
-        assert_eq!(&expected, &entry.properties);
+        assert_eq!(&expected, &range.properties);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn test_read_self() -> std::io::Result<()> {
+        let map = NumaMap::from_file("/proc/self/numa_maps")?;
+        assert!(map.ranges.len() > 0);
+        Ok(())
     }
 }
